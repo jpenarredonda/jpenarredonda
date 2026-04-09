@@ -28,6 +28,7 @@ REQUISITOS (instala con: pip install -r requirements.txt):
 import csv
 import json
 import random
+import re
 import time
 import jmespath
 from curl_cffi import requests as cf_requests
@@ -87,8 +88,8 @@ def _get_json(url: str) -> dict:
 
 def _get_csrftoken() -> str:
     """
-    Hace una petición simple a Instagram para obtener el csrftoken de las cookies.
-    Es necesario para las peticiones POST (paginación).
+    Obtiene el csrftoken necesario para peticiones POST.
+    Lo busca en: cookies de respuesta → header Set-Cookie → HTML de la página.
     """
     resp = cf_requests.get(
         "https://www.instagram.com/",
@@ -96,7 +97,28 @@ def _get_csrftoken() -> str:
         cookies=COOKIES,
         impersonate="chrome110",
     )
-    return resp.cookies.get("csrftoken", "")
+
+    # 1) Desde el dict de cookies de la respuesta
+    token = resp.cookies.get("csrftoken", "")
+    if token:
+        return token
+
+    # 2) Desde el header Set-Cookie (a veces curl_cffi no parsea las cookies)
+    set_cookie = resp.headers.get("set-cookie", "")
+    match = re.search(r"csrftoken=([^;,\s]+)", set_cookie)
+    if match:
+        return match.group(1)
+
+    # 3) Desde el HTML de la página (Instagram lo incrusta en el JS)
+    match = re.search(r'"csrf_token"\s*:\s*"([^"]+)"', resp.text)
+    if match:
+        return match.group(1)
+
+    match = re.search(r'csrftoken=([^;,\s"]+)', resp.text)
+    if match:
+        return match.group(1)
+
+    return ""
 
 
 def _get_pagina_posts(user_id: str, cursor: str, csrftoken: str) -> dict:
