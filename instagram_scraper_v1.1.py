@@ -28,9 +28,12 @@ from curl_cffi import requests as cf_requests
 # CONFIGURACIÓN
 # =============================================================================
 
-API_URL      = "https://i.instagram.com/api/v1/users/web_profile_info/?username={}"
-GRAPHQL_URL  = "https://www.instagram.com/graphql/query/"
-POSTS_QUERY_HASH = "e769aa130647d2354c40ea6a439bfc08"  # hash estable para posts de usuario
+API_URL     = "https://i.instagram.com/api/v1/users/web_profile_info/?username={}"
+GRAPHQL_URL = "https://www.instagram.com/graphql/query"
+
+# Dos métodos de paginación; se intentan en orden hasta que uno funcione
+QUERY_HASH = "e769aa130647d2354c40ea6a439bfc08"
+DOC_ID     = "9310670392322965"
 
 HEADERS = {
     "x-ig-app-id": "936619743392459",
@@ -69,6 +72,70 @@ def _get_json(url: str) -> dict:
     except Exception:
         print("[✗] La respuesta no es JSON válido. Instagram pudo haber bloqueado la petición.")
         return {}
+
+
+def _get_pagina_posts(user_id: str, cursor: str) -> dict:
+    """
+    Intenta obtener una página de posts con dos métodos distintos:
+      1) GET con query_hash (método antiguo, a veces bloqueado)
+      2) POST con doc_id   (método más moderno)
+    Retorna el JSON con los posts, o {} si ambos fallan.
+    """
+    variables = json.dumps({"id": user_id, "first": 12, "after": cursor})
+
+    # --- Método 1: GET con query_hash ---
+    url = f"{GRAPHQL_URL}?query_hash={QUERY_HASH}&variables={variables}"
+    resp = cf_requests.get(url, headers=HEADERS, impersonate="chrome110")
+
+    if resp.status_code == 200 and resp.content:
+        try:
+            datos = resp.json()
+            if jmespath.search("data.user.edge_owner_to_timeline_media", datos):
+                return datos
+        except Exception:
+            pass
+
+    # --- Método 2: POST con doc_id ---
+    headers_post = {**HEADERS, "content-type": "application/x-www-form-urlencoded"}
+    resp = cf_requests.post(
+        GRAPHQL_URL,
+        data={"doc_id": DOC_ID, "variables": variables},
+        headers=headers_post,
+        impersonate="chrome110",
+    )
+
+    if resp.status_code == 200 and resp.content:
+        try:
+            datos = resp.json()
+            # doc_id puede devolver la conexión bajo una clave distinta;
+            # normalizamos para que el resto del código funcione igual
+            conexion = jmespath.search(
+                "data.xdt_api__v1__feed__user_timeline_graphql_connection", datos
+            )
+            if conexion:
+                # Convertimos al mismo formato que usa el método 1
+                return {
+                    "data": {
+                        "user": {
+                            "edge_owner_to_timeline_media": {
+                                "edges":     conexion.get("edges", []),
+                                "page_info": conexion.get("page_info", {}),
+                            }
+                        }
+                    }
+                }
+            # A veces el doc_id devuelve el formato estándar directamente
+            if jmespath.search("data.user.edge_owner_to_timeline_media", datos):
+                return datos
+        except Exception:
+            pass
+
+    # Ambos métodos fallaron; mostrar diagnóstico
+    print(f"\n[!] Ambos métodos de paginación fallaron.")
+    print(f"    Código HTTP último intento: {resp.status_code}")
+    if resp.content:
+        print(f"    Respuesta (primeros 300 caracteres): {resp.text[:300]}")
+    return {}
 
 
 def _parsear_nodo(nodo: dict) -> dict:
@@ -148,9 +215,9 @@ def obtener_todas_publicaciones(usuario: str) -> list:
         print("[✗] No se encontraron datos del usuario.")
         return []
 
-    user_id   = user_data.get("id")
-    media     = user_data.get("edge_owner_to_timeline_media", {})
-    total     = media.get("count", 0)
+    user_id = user_data.get("id")
+    media   = user_data.get("edge_owner_to_timeline_media", {})
+    total   = media.get("count", 0)
 
     publicaciones = [_parsear_nodo(e["node"]) for e in media.get("edges", [])]
 
@@ -161,17 +228,15 @@ def obtener_todas_publicaciones(usuario: str) -> list:
     print(f"[→] Total en el perfil: {total} publicaciones")
     print(f"[→] Obtenidas: {len(publicaciones)}/{total}", end="", flush=True)
 
-    # --- Páginas siguientes via GraphQL ---
+    # --- Páginas siguientes ---
     pagina = 2
     while has_next and cursor:
-        time.sleep(1.5)  # Pausa cortés para no provocar bloqueo
+        time.sleep(1.5)  # pausa para no provocar bloqueo
 
-        variables = json.dumps({"id": user_id, "first": 12, "after": cursor})
-        url = f"{GRAPHQL_URL}?query_hash={POSTS_QUERY_HASH}&variables={variables}"
-
-        datos = _get_json(url)
+        datos = _get_pagina_posts(user_id, cursor)
         if not datos:
-            print(f"\n[!] No se pudo obtener la página {pagina}. Deteniendo.")
+            print(f"\n[!] Se detuvo en la página {pagina}. "
+                  f"Se guardaron {len(publicaciones)} publicaciones.")
             break
 
         media = jmespath.search("data.user.edge_owner_to_timeline_media", datos)
