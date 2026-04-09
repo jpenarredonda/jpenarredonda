@@ -24,14 +24,14 @@ from curl_cffi import requests as cf_requests
 # CONFIGURACIÓN
 # =============================================================================
 
-# URL base de Instagram
-BASE_URL = "https://www.instagram.com"
+# Endpoint de la API interna de Instagram (más estable que ?__a=1)
+API_URL = "https://i.instagram.com/api/v1/users/web_profile_info/?username={}"
 
 # Headers que imitan a un navegador real para no ser bloqueados
 HEADERS = {
     "x-ig-app-id": "936619743392459",
-    "x-asbd-id": "129477",
-    "x-ig-www-claim": "0",
+    "x-requested-with": "XMLHttpRequest",
+    "referer": "https://www.instagram.com/",
     "origin": "https://www.instagram.com",
     "accept": "*/*",
     "accept-language": "en-US,en;q=0.9",
@@ -41,6 +41,27 @@ HEADERS = {
         "Chrome/122.0.0.0 Safari/537.36"
     ),
 }
+
+
+def _get_json(usuario: str) -> dict:
+    """Hace la petición a la API de Instagram y retorna el JSON, o {} si falla."""
+    url = API_URL.format(usuario)
+    respuesta = cf_requests.get(url, headers=HEADERS, impersonate="chrome110")
+
+    if not (200 <= respuesta.status_code < 300):
+        print(f"[✗] Error HTTP {respuesta.status_code}.")
+        return {}
+
+    if not respuesta.content:
+        print("[✗] Instagram devolvió una respuesta vacía (posible bloqueo temporal).")
+        print("    Espera unos minutos e inténtalo de nuevo.")
+        return {}
+
+    try:
+        return respuesta.json()
+    except Exception:
+        print("[✗] La respuesta no es JSON válido. Instagram pudo haber bloqueado la petición.")
+        return {}
 
 
 # =============================================================================
@@ -57,40 +78,34 @@ def obtener_perfil(usuario: str) -> dict:
     Retorna:
         dict: Diccionario con los datos del perfil, o {} si hubo error.
     """
-    url = f"{BASE_URL}/{usuario}/?__a=1&__d=dis"
     print(f"\n[→] Buscando perfil de @{usuario}...")
 
-    # Hacemos la petición imitando Chrome (imprescindible para no ser bloqueados)
-    respuesta = cf_requests.get(url, headers=HEADERS, impersonate="chrome110")
-
-    if not (200 <= respuesta.status_code < 300):
-        print(f"[✗] Error {respuesta.status_code}: no se pudo obtener el perfil.")
+    datos_json = _get_json(usuario)
+    if not datos_json:
         return {}
-
-    datos_json = respuesta.json()
 
     # Extraemos solo los campos que nos interesan con jmespath
     perfil = jmespath.search(
         """{
-            nombre:       graphql.user.full_name,
-            usuario:      graphql.user.username,
-            bio:          graphql.user.biography,
-            seguidores:   graphql.user.edge_followed_by.count,
-            siguiendo:    graphql.user.edge_follow.count,
-            publicaciones:graphql.user.edge_owner_to_timeline_media.count,
-            es_privado:   graphql.user.is_private,
-            es_verificado:graphql.user.is_verified,
-            foto_perfil:  graphql.user.profile_pic_url_hd,
-            sitio_web:    graphql.user.external_url
+            nombre:        data.user.full_name,
+            usuario:       data.user.username,
+            bio:           data.user.biography,
+            seguidores:    data.user.edge_followed_by.count,
+            siguiendo:     data.user.edge_follow.count,
+            publicaciones: data.user.edge_owner_to_timeline_media.count,
+            es_privado:    data.user.is_private,
+            es_verificado: data.user.is_verified,
+            foto_perfil:   data.user.profile_pic_url_hd,
+            sitio_web:     data.user.external_url
         }""",
         datos_json,
     )
 
-    if not perfil:
+    if not perfil or not perfil.get("usuario"):
         print("[✗] No se encontraron datos. El perfil puede ser privado o no existir.")
         return {}
 
-    print(f"[✓] Perfil obtenido: {perfil.get('nombre', 'Sin nombre')}")
+    print(f"[✓] Perfil obtenido: {perfil.get('nombre') or perfil.get('usuario')}")
     return perfil
 
 
@@ -108,20 +123,15 @@ def obtener_publicaciones(usuario: str) -> list:
     Retorna:
         list: Lista de diccionarios, cada uno con datos de una publicación.
     """
-    url = f"{BASE_URL}/{usuario}/?__a=1&__d=dis"
     print(f"\n[→] Buscando publicaciones de @{usuario}...")
 
-    respuesta = cf_requests.get(url, headers=HEADERS, impersonate="chrome110")
-
-    if not (200 <= respuesta.status_code < 300):
-        print(f"[✗] Error {respuesta.status_code}: no se pudieron obtener las publicaciones.")
+    datos_json = _get_json(usuario)
+    if not datos_json:
         return []
-
-    datos_json = respuesta.json()
 
     # Extraemos la lista de publicaciones desde la respuesta JSON
     nodos = jmespath.search(
-        "graphql.user.edge_owner_to_timeline_media.edges[*].node",
+        "data.user.edge_owner_to_timeline_media.edges[*].node",
         datos_json,
     )
 
@@ -132,19 +142,19 @@ def obtener_publicaciones(usuario: str) -> list:
     publicaciones = []
     for nodo in nodos:
         pub = {
-            "id":            nodo.get("id"),
-            "tipo":          nodo.get("__typename"),           # Image, Video, etc.
-            "descripcion":   jmespath.search(
-                                 "edge_media_to_caption.edges[0].node.text", nodo
-                             ) or "(sin descripción)",
-            "me_gustas":     nodo.get("edge_liked_by", {}).get("count", 0),
-            "comentarios":   nodo.get("edge_media_to_comment", {}).get("count", 0),
-            "fecha":         time.strftime(
-                                 "%Y-%m-%d %H:%M:%S",
-                                 time.gmtime(nodo.get("taken_at_timestamp", 0)),
-                             ),
-            "url_imagen":    nodo.get("display_url"),
-            "url_post":      f"https://www.instagram.com/p/{nodo.get('shortcode')}/",
+            "id":          nodo.get("id"),
+            "tipo":        nodo.get("__typename"),           # Image, Video, etc.
+            "descripcion": jmespath.search(
+                               "edge_media_to_caption.edges[0].node.text", nodo
+                           ) or "(sin descripción)",
+            "me_gustas":   nodo.get("edge_liked_by", {}).get("count", 0),
+            "comentarios": nodo.get("edge_media_to_comment", {}).get("count", 0),
+            "fecha":       time.strftime(
+                               "%Y-%m-%d %H:%M:%S",
+                               time.gmtime(nodo.get("taken_at_timestamp", 0)),
+                           ),
+            "url_imagen":  nodo.get("display_url"),
+            "url_post":    f"https://www.instagram.com/p/{nodo.get('shortcode')}/",
         }
         publicaciones.append(pub)
 
@@ -208,7 +218,6 @@ if __name__ == "__main__":
             print(f"       Me gustas:   {pub['me_gustas']}")
             print(f"       Comentarios: {pub['comentarios']}")
             print(f"       URL:         {pub['url_post']}")
-            # Mostrar solo los primeros 80 caracteres de la descripción
             desc = pub['descripcion'][:80] + "..." if len(pub['descripcion']) > 80 else pub['descripcion']
             print(f"       Descripción: {desc}")
 
