@@ -7,10 +7,18 @@ NOVEDADES v1.1:
 - Solicita el usuario por teclado al arrancar (no hay que editar el código)
 - Genera archivos CSV además de JSON
 - Descarga TODAS las publicaciones del perfil (con paginación automática)
+- Login via cookie de sesión para evitar bloqueos en la paginación
+
+CÓMO OBTENER TU SESSION ID:
+  1. Abre Instagram en Chrome y logéate
+  2. Presiona F12 → pestaña "Application" → "Cookies" → https://www.instagram.com
+  3. Copia el valor de "sessionid"
+  4. Pégalo cuando el script te lo pida
 
 IMPORTANTE:
-- Solo funciona con perfiles y publicaciones PÚBLICAS (sin iniciar sesión).
-- Respeta los Términos de Servicio de Instagram. Úsalo solo con fines educativos.
+- No compartas tu sessionid con nadie (es equivalente a tu contraseña).
+- Solo funciona con perfiles PÚBLICOS o los que puedes ver logueado.
+- Úsalo solo con fines educativos.
 
 REQUISITOS (instala con: pip install -r requirements.txt):
 - curl_cffi
@@ -31,10 +39,8 @@ from curl_cffi import requests as cf_requests
 
 API_URL     = "https://i.instagram.com/api/v1/users/web_profile_info/?username={}"
 GRAPHQL_URL = "https://www.instagram.com/graphql/query"
-
-# Dos métodos de paginación; se intentan en orden hasta que uno funcione
-QUERY_HASH = "e769aa130647d2354c40ea6a439bfc08"
-DOC_ID     = "9310670392322965"
+QUERY_HASH  = "e769aa130647d2354c40ea6a439bfc08"
+DOC_ID      = "9310670392322965"
 
 HEADERS = {
     "x-ig-app-id": "936619743392459",
@@ -50,43 +56,62 @@ HEADERS = {
     ),
 }
 
+# Se rellena al inicio con la cookie del usuario
+COOKIES: dict = {}
+
 
 # =============================================================================
 # HELPERS INTERNOS
 # =============================================================================
 
 def _get_json(url: str) -> dict:
-    """Hace una petición GET y retorna el JSON, o {} si falla."""
-    respuesta = cf_requests.get(url, headers=HEADERS, impersonate="chrome110")
+    """Hace una petición GET autenticada y retorna el JSON, o {} si falla."""
+    respuesta = cf_requests.get(
+        url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110"
+    )
 
     if not (200 <= respuesta.status_code < 300):
         print(f"[✗] Error HTTP {respuesta.status_code}.")
         return {}
 
     if not respuesta.content:
-        print("[✗] Instagram devolvió una respuesta vacía (posible bloqueo temporal).")
-        print("    Espera unos minutos e inténtalo de nuevo.")
+        print("[✗] Instagram devolvió una respuesta vacía.")
         return {}
 
     try:
         return respuesta.json()
     except Exception:
-        print("[✗] La respuesta no es JSON válido. Instagram pudo haber bloqueado la petición.")
+        print("[✗] La respuesta no es JSON válido.")
         return {}
 
 
-def _get_pagina_posts(user_id: str, cursor: str) -> dict:
+def _get_csrftoken() -> str:
     """
-    Intenta obtener una página de posts con dos métodos distintos:
-      1) GET con query_hash (método antiguo, a veces bloqueado)
-      2) POST con doc_id   (método más moderno)
-    Retorna el JSON con los posts, o {} si ambos fallan.
+    Hace una petición simple a Instagram para obtener el csrftoken de las cookies.
+    Es necesario para las peticiones POST (paginación).
+    """
+    resp = cf_requests.get(
+        "https://www.instagram.com/",
+        headers=HEADERS,
+        cookies=COOKIES,
+        impersonate="chrome110",
+    )
+    return resp.cookies.get("csrftoken", "")
+
+
+def _get_pagina_posts(user_id: str, cursor: str, csrftoken: str) -> dict:
+    """
+    Intenta obtener una página de posts con dos métodos:
+      1) GET con query_hash
+      2) POST con doc_id (usa csrftoken para autenticación)
     """
     variables = json.dumps({"id": user_id, "first": 12, "after": cursor})
 
     # --- Método 1: GET con query_hash ---
     url = f"{GRAPHQL_URL}?query_hash={QUERY_HASH}&variables={variables}"
-    resp = cf_requests.get(url, headers=HEADERS, impersonate="chrome110")
+    resp = cf_requests.get(
+        url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110"
+    )
 
     if resp.status_code == 200 and resp.content:
         try:
@@ -97,24 +122,29 @@ def _get_pagina_posts(user_id: str, cursor: str) -> dict:
             pass
 
     # --- Método 2: POST con doc_id ---
-    headers_post = {**HEADERS, "content-type": "application/x-www-form-urlencoded"}
+    headers_post = {
+        **HEADERS,
+        "content-type": "application/x-www-form-urlencoded",
+        "x-csrftoken": csrftoken,
+    }
+    cookies_post = {**COOKIES, "csrftoken": csrftoken}
+
     resp = cf_requests.post(
         GRAPHQL_URL,
         data={"doc_id": DOC_ID, "variables": variables},
         headers=headers_post,
+        cookies=cookies_post,
         impersonate="chrome110",
     )
 
     if resp.status_code == 200 and resp.content:
         try:
             datos = resp.json()
-            # doc_id puede devolver la conexión bajo una clave distinta;
-            # normalizamos para que el resto del código funcione igual
+            # Normalizar respuesta del doc_id al mismo formato que query_hash
             conexion = jmespath.search(
                 "data.xdt_api__v1__feed__user_timeline_graphql_connection", datos
             )
             if conexion:
-                # Convertimos al mismo formato que usa el método 1
                 return {
                     "data": {
                         "user": {
@@ -125,17 +155,16 @@ def _get_pagina_posts(user_id: str, cursor: str) -> dict:
                         }
                     }
                 }
-            # A veces el doc_id devuelve el formato estándar directamente
             if jmespath.search("data.user.edge_owner_to_timeline_media", datos):
                 return datos
         except Exception:
             pass
 
-    # Ambos métodos fallaron; mostrar diagnóstico
+    # Diagnóstico si ambos fallan
     print(f"\n[!] Ambos métodos de paginación fallaron.")
-    print(f"    Código HTTP último intento: {resp.status_code}")
+    print(f"    Código HTTP: {resp.status_code}")
     if resp.content:
-        print(f"    Respuesta (primeros 300 caracteres): {resp.text[:300]}")
+        print(f"    Respuesta: {resp.text[:300]}")
     return {}
 
 
@@ -198,15 +227,12 @@ def obtener_perfil(usuario: str) -> dict:
 # FUNCIÓN 2: Obtener TODAS las publicaciones con paginación
 # =============================================================================
 
-def obtener_todas_publicaciones(usuario: str) -> list:
+def obtener_todas_publicaciones(usuario: str, csrftoken: str) -> list:
     """
-    Descarga TODAS las publicaciones de un perfil público usando paginación.
-    Instagram entrega 12 por vez; esta función sigue pidiendo páginas hasta
-    obtenerlas todas.
+    Descarga TODAS las publicaciones de un perfil usando paginación autenticada.
     """
     print(f"\n[→] Buscando todas las publicaciones de @{usuario}...")
 
-    # --- Página 1: viene incluida en la respuesta del perfil ---
     datos_json = _get_json(API_URL.format(usuario))
     if not datos_json:
         return []
@@ -229,14 +255,13 @@ def obtener_todas_publicaciones(usuario: str) -> list:
     print(f"[→] Total en el perfil: {total} publicaciones")
     print(f"[→] Obtenidas: {len(publicaciones)}/{total}", end="", flush=True)
 
-    # --- Páginas siguientes ---
     pagina = 2
     while has_next and cursor:
-        pausa = random.uniform(4.0, 7.0)  # pausa aleatoria entre 4 y 7 segundos
-        print(f"\r[→] Esperando {pausa:.1f}s antes de la siguiente página...", end="", flush=True)
+        pausa = random.uniform(4.0, 7.0)
+        print(f"\r[→] Esperando {pausa:.1f}s...                          ", end="", flush=True)
         time.sleep(pausa)
 
-        datos = _get_pagina_posts(user_id, cursor)
+        datos = _get_pagina_posts(user_id, cursor, csrftoken)
         if not datos:
             print(f"\n[!] Se detuvo en la página {pagina}. "
                   f"Se guardaron {len(publicaciones)} publicaciones.")
@@ -247,17 +272,16 @@ def obtener_todas_publicaciones(usuario: str) -> list:
             print(f"\n[!] Respuesta inesperada en página {pagina}. Deteniendo.")
             break
 
-        nuevas = [_parsear_nodo(e["node"]) for e in media.get("edges", [])]
-        publicaciones.extend(nuevas)
+        publicaciones.extend([_parsear_nodo(e["node"]) for e in media.get("edges", [])])
 
         page_info = media.get("page_info", {})
         has_next  = page_info.get("has_next_page", False)
         cursor    = page_info.get("end_cursor")
 
-        print(f"\r[→] Obtenidas: {len(publicaciones)}/{total}", end="", flush=True)
+        print(f"\r[→] Obtenidas: {len(publicaciones)}/{total}          ", end="", flush=True)
         pagina += 1
 
-    print()  # salto de línea final
+    print()
     print(f"[✓] Total descargadas: {len(publicaciones)} publicaciones.")
     return publicaciones
 
@@ -267,7 +291,6 @@ def obtener_todas_publicaciones(usuario: str) -> list:
 # =============================================================================
 
 def guardar_json(datos, nombre_archivo: str):
-    """Guarda un diccionario o lista en un archivo .json legible."""
     with open(nombre_archivo, "w", encoding="utf-8") as f:
         json.dump(datos, f, ensure_ascii=False, indent=2)
     print(f"[✓] JSON guardado en:  {nombre_archivo}")
@@ -278,20 +301,16 @@ def guardar_json(datos, nombre_archivo: str):
 # =============================================================================
 
 def guardar_csv(datos, nombre_archivo: str):
-    """Guarda una lista de diccionarios (o un solo dict) en un archivo .csv."""
     if isinstance(datos, dict):
         datos = [datos]
-
     if not datos:
         print("[!] No hay datos para guardar en CSV.")
         return
-
     columnas = list(datos[0].keys())
     with open(nombre_archivo, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columnas)
         writer.writeheader()
         writer.writerows(datos)
-
     print(f"[✓] CSV guardado en:   {nombre_archivo}")
 
 
@@ -301,11 +320,35 @@ def guardar_csv(datos, nombre_archivo: str):
 
 if __name__ == "__main__":
 
-    print("=" * 50)
+    print("=" * 55)
     print("   Instagram Scraper v1.1")
-    print("=" * 50)
-    USUARIO = input("\nIngresa el usuario de Instagram (sin @): ").strip()
+    print("=" * 55)
 
+    # --- Pedir session id ---
+    print("\nPara evitar bloqueos, el script necesita tu cookie de sesión.")
+    print("Cómo obtenerla:")
+    print("  1. Abre Instagram en Chrome y logéate")
+    print("  2. Presiona F12 → Application → Cookies → instagram.com")
+    print("  3. Copia el valor de 'sessionid'\n")
+    session_id = input("Pega tu sessionid aquí: ").strip()
+
+    if not session_id:
+        print("[!] No ingresaste sessionid. Se intentará sin sesión (puede fallar).")
+    else:
+        COOKIES["sessionid"] = session_id
+        print("[✓] Sesión configurada.")
+
+    # Obtener csrftoken (necesario para peticiones POST)
+    print("[→] Obteniendo token de seguridad...")
+    csrftoken = _get_csrftoken()
+    if csrftoken:
+        COOKIES["csrftoken"] = csrftoken
+        print("[✓] Token obtenido.")
+    else:
+        print("[!] No se pudo obtener el csrftoken. La paginación puede fallar.")
+
+    # --- Pedir usuario ---
+    USUARIO = input("\nIngresa el usuario de Instagram a analizar (sin @): ").strip()
     if not USUARIO:
         print("[✗] No ingresaste ningún usuario. Saliendo.")
         exit(1)
@@ -317,14 +360,13 @@ if __name__ == "__main__":
         print("\n--- DATOS DEL PERFIL ---")
         for clave, valor in perfil.items():
             print(f"  {clave:>15}: {valor}")
-
         guardar_json(perfil, f"{USUARIO}_perfil.json")
         guardar_csv(perfil,  f"{USUARIO}_perfil.csv")
 
-    time.sleep(1)
+    time.sleep(2)
 
     # --- Todas las publicaciones ---
-    publicaciones = obtener_todas_publicaciones(USUARIO)
+    publicaciones = obtener_todas_publicaciones(USUARIO, csrftoken)
 
     if publicaciones:
         print(f"\n--- PRIMERAS 5 PUBLICACIONES (muestra) ---")
