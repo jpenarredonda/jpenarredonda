@@ -71,8 +71,11 @@ def _get_json(url: str) -> dict:
         url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110"
     )
 
+    print(f"    [debug] HTTP {respuesta.status_code} | {len(respuesta.content)} bytes")
+
     if not (200 <= respuesta.status_code < 300):
         print(f"[✗] Error HTTP {respuesta.status_code}.")
+        print(f"    Respuesta: {respuesta.text[:400]}")
         return {}
 
     if not respuesta.content:
@@ -80,9 +83,13 @@ def _get_json(url: str) -> dict:
         return {}
 
     try:
-        return respuesta.json()
+        datos = respuesta.json()
+        # Mostrar las claves de primer nivel para entender la estructura
+        print(f"    [debug] Claves en respuesta: {list(datos.keys())}")
+        return datos
     except Exception:
         print("[✗] La respuesta no es JSON válido.")
+        print(f"    Primeros 400 caracteres: {respuesta.text[:400]}")
         return {}
 
 
