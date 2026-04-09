@@ -19,6 +19,7 @@ REQUISITOS (instala con: pip install -r requirements.txt):
 
 import csv
 import json
+import random
 import time
 import jmespath
 from curl_cffi import requests as cf_requests
@@ -231,7 +232,9 @@ def obtener_todas_publicaciones(usuario: str) -> list:
     # --- Páginas siguientes ---
     pagina = 2
     while has_next and cursor:
-        time.sleep(1.5)  # pausa para no provocar bloqueo
+        pausa = random.uniform(4.0, 7.0)  # pausa aleatoria entre 4 y 7 segundos
+        print(f"\r[→] Esperando {pausa:.1f}s antes de la siguiente página...", end="", flush=True)
+        time.sleep(pausa)
 
         datos = _get_pagina_posts(user_id, cursor)
         if not datos:
