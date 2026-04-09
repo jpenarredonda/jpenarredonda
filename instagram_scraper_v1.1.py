@@ -6,6 +6,7 @@ Basado en: https://scrapfly.io/blog/posts/how-to-scrape-instagram
 NOVEDADES v1.1:
 - Solicita el usuario por teclado al arrancar (no hay que editar el código)
 - Genera archivos CSV además de JSON
+- Descarga TODAS las publicaciones del perfil (con paginación automática)
 
 IMPORTANTE:
 - Solo funciona con perfiles y publicaciones PÚBLICAS (sin iniciar sesión).
@@ -27,7 +28,9 @@ from curl_cffi import requests as cf_requests
 # CONFIGURACIÓN
 # =============================================================================
 
-API_URL = "https://i.instagram.com/api/v1/users/web_profile_info/?username={}"
+API_URL      = "https://i.instagram.com/api/v1/users/web_profile_info/?username={}"
+GRAPHQL_URL  = "https://www.instagram.com/graphql/query/"
+POSTS_QUERY_HASH = "e769aa130647d2354c40ea6a439bfc08"  # hash estable para posts de usuario
 
 HEADERS = {
     "x-ig-app-id": "936619743392459",
@@ -44,9 +47,12 @@ HEADERS = {
 }
 
 
-def _get_json(usuario: str) -> dict:
-    """Hace la petición a la API de Instagram y retorna el JSON, o {} si falla."""
-    url = API_URL.format(usuario)
+# =============================================================================
+# HELPERS INTERNOS
+# =============================================================================
+
+def _get_json(url: str) -> dict:
+    """Hace una petición GET y retorna el JSON, o {} si falla."""
     respuesta = cf_requests.get(url, headers=HEADERS, impersonate="chrome110")
 
     if not (200 <= respuesta.status_code < 300):
@@ -65,6 +71,25 @@ def _get_json(usuario: str) -> dict:
         return {}
 
 
+def _parsear_nodo(nodo: dict) -> dict:
+    """Convierte un nodo de publicación en un diccionario limpio."""
+    return {
+        "id":          nodo.get("id"),
+        "tipo":        nodo.get("__typename"),
+        "descripcion": jmespath.search(
+                           "edge_media_to_caption.edges[0].node.text", nodo
+                       ) or "(sin descripción)",
+        "me_gustas":   nodo.get("edge_liked_by", {}).get("count", 0),
+        "comentarios": nodo.get("edge_media_to_comment", {}).get("count", 0),
+        "fecha":       time.strftime(
+                           "%Y-%m-%d %H:%M:%S",
+                           time.gmtime(nodo.get("taken_at_timestamp", 0)),
+                       ),
+        "url_imagen":  nodo.get("display_url"),
+        "url_post":    f"https://www.instagram.com/p/{nodo.get('shortcode')}/",
+    }
+
+
 # =============================================================================
 # FUNCIÓN 1: Obtener información del perfil
 # =============================================================================
@@ -73,7 +98,7 @@ def obtener_perfil(usuario: str) -> dict:
     """Descarga los datos públicos del perfil de un usuario de Instagram."""
     print(f"\n[→] Buscando perfil de @{usuario}...")
 
-    datos_json = _get_json(usuario)
+    datos_json = _get_json(API_URL.format(usuario))
     if not datos_json:
         return {}
 
@@ -102,46 +127,70 @@ def obtener_perfil(usuario: str) -> dict:
 
 
 # =============================================================================
-# FUNCIÓN 2: Obtener publicaciones recientes del perfil
+# FUNCIÓN 2: Obtener TODAS las publicaciones con paginación
 # =============================================================================
 
-def obtener_publicaciones(usuario: str) -> list:
-    """Descarga las publicaciones recientes (hasta 12) de un perfil público."""
-    print(f"\n[→] Buscando publicaciones de @{usuario}...")
+def obtener_todas_publicaciones(usuario: str) -> list:
+    """
+    Descarga TODAS las publicaciones de un perfil público usando paginación.
+    Instagram entrega 12 por vez; esta función sigue pidiendo páginas hasta
+    obtenerlas todas.
+    """
+    print(f"\n[→] Buscando todas las publicaciones de @{usuario}...")
 
-    datos_json = _get_json(usuario)
+    # --- Página 1: viene incluida en la respuesta del perfil ---
+    datos_json = _get_json(API_URL.format(usuario))
     if not datos_json:
         return []
 
-    nodos = jmespath.search(
-        "data.user.edge_owner_to_timeline_media.edges[*].node",
-        datos_json,
-    )
-
-    if not nodos:
-        print("[✗] No se encontraron publicaciones. El perfil puede ser privado.")
+    user_data = jmespath.search("data.user", datos_json)
+    if not user_data:
+        print("[✗] No se encontraron datos del usuario.")
         return []
 
-    publicaciones = []
-    for nodo in nodos:
-        pub = {
-            "id":          nodo.get("id"),
-            "tipo":        nodo.get("__typename"),
-            "descripcion": jmespath.search(
-                               "edge_media_to_caption.edges[0].node.text", nodo
-                           ) or "(sin descripción)",
-            "me_gustas":   nodo.get("edge_liked_by", {}).get("count", 0),
-            "comentarios": nodo.get("edge_media_to_comment", {}).get("count", 0),
-            "fecha":       time.strftime(
-                               "%Y-%m-%d %H:%M:%S",
-                               time.gmtime(nodo.get("taken_at_timestamp", 0)),
-                           ),
-            "url_imagen":  nodo.get("display_url"),
-            "url_post":    f"https://www.instagram.com/p/{nodo.get('shortcode')}/",
-        }
-        publicaciones.append(pub)
+    user_id   = user_data.get("id")
+    media     = user_data.get("edge_owner_to_timeline_media", {})
+    total     = media.get("count", 0)
 
-    print(f"[✓] Se encontraron {len(publicaciones)} publicaciones.")
+    publicaciones = [_parsear_nodo(e["node"]) for e in media.get("edges", [])]
+
+    page_info = media.get("page_info", {})
+    has_next  = page_info.get("has_next_page", False)
+    cursor    = page_info.get("end_cursor")
+
+    print(f"[→] Total en el perfil: {total} publicaciones")
+    print(f"[→] Obtenidas: {len(publicaciones)}/{total}", end="", flush=True)
+
+    # --- Páginas siguientes via GraphQL ---
+    pagina = 2
+    while has_next and cursor:
+        time.sleep(1.5)  # Pausa cortés para no provocar bloqueo
+
+        variables = json.dumps({"id": user_id, "first": 12, "after": cursor})
+        url = f"{GRAPHQL_URL}?query_hash={POSTS_QUERY_HASH}&variables={variables}"
+
+        datos = _get_json(url)
+        if not datos:
+            print(f"\n[!] No se pudo obtener la página {pagina}. Deteniendo.")
+            break
+
+        media = jmespath.search("data.user.edge_owner_to_timeline_media", datos)
+        if not media:
+            print(f"\n[!] Respuesta inesperada en página {pagina}. Deteniendo.")
+            break
+
+        nuevas = [_parsear_nodo(e["node"]) for e in media.get("edges", [])]
+        publicaciones.extend(nuevas)
+
+        page_info = media.get("page_info", {})
+        has_next  = page_info.get("has_next_page", False)
+        cursor    = page_info.get("end_cursor")
+
+        print(f"\r[→] Obtenidas: {len(publicaciones)}/{total}", end="", flush=True)
+        pagina += 1
+
+    print()  # salto de línea final
+    print(f"[✓] Total descargadas: {len(publicaciones)} publicaciones.")
     return publicaciones
 
 
@@ -161,11 +210,7 @@ def guardar_json(datos, nombre_archivo: str):
 # =============================================================================
 
 def guardar_csv(datos, nombre_archivo: str):
-    """
-    Guarda una lista de diccionarios en un archivo .csv.
-    Si se le pasa un solo diccionario (perfil), lo convierte en una lista primero.
-    """
-    # Si es un dict (perfil), lo envolvemos en lista para que csv lo trate igual
+    """Guarda una lista de diccionarios (o un solo dict) en un archivo .csv."""
     if isinstance(datos, dict):
         datos = [datos]
 
@@ -174,7 +219,6 @@ def guardar_csv(datos, nombre_archivo: str):
         return
 
     columnas = list(datos[0].keys())
-
     with open(nombre_archivo, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=columnas)
         writer.writeheader()
@@ -189,9 +233,6 @@ def guardar_csv(datos, nombre_archivo: str):
 
 if __name__ == "__main__":
 
-    # -------------------------------------------------------
-    # Solicitar usuario por teclado
-    # -------------------------------------------------------
     print("=" * 50)
     print("   Instagram Scraper v1.1")
     print("=" * 50)
@@ -201,9 +242,7 @@ if __name__ == "__main__":
         print("[✗] No ingresaste ningún usuario. Saliendo.")
         exit(1)
 
-    # -------------------------------------------------------
-    # Obtener y guardar perfil
-    # -------------------------------------------------------
+    # --- Perfil ---
     perfil = obtener_perfil(USUARIO)
 
     if perfil:
@@ -211,19 +250,17 @@ if __name__ == "__main__":
         for clave, valor in perfil.items():
             print(f"  {clave:>15}: {valor}")
 
-        guardar_json(perfil,  f"{USUARIO}_perfil.json")
-        guardar_csv(perfil,   f"{USUARIO}_perfil.csv")
+        guardar_json(perfil, f"{USUARIO}_perfil.json")
+        guardar_csv(perfil,  f"{USUARIO}_perfil.csv")
 
     time.sleep(1)
 
-    # -------------------------------------------------------
-    # Obtener y guardar publicaciones
-    # -------------------------------------------------------
-    publicaciones = obtener_publicaciones(USUARIO)
+    # --- Todas las publicaciones ---
+    publicaciones = obtener_todas_publicaciones(USUARIO)
 
     if publicaciones:
-        print(f"\n--- ÚLTIMAS {len(publicaciones)} PUBLICACIONES ---")
-        for i, pub in enumerate(publicaciones, 1):
+        print(f"\n--- PRIMERAS 5 PUBLICACIONES (muestra) ---")
+        for i, pub in enumerate(publicaciones[:5], 1):
             print(f"\n  [{i}] {pub['fecha']}")
             print(f"       Tipo:        {pub['tipo']}")
             print(f"       Me gustas:   {pub['me_gustas']}")
@@ -231,6 +268,9 @@ if __name__ == "__main__":
             print(f"       URL:         {pub['url_post']}")
             desc = pub['descripcion'][:80] + "..." if len(pub['descripcion']) > 80 else pub['descripcion']
             print(f"       Descripción: {desc}")
+
+        if len(publicaciones) > 5:
+            print(f"\n  ... y {len(publicaciones) - 5} publicaciones más (ver archivos).")
 
         guardar_json(publicaciones, f"{USUARIO}_publicaciones.json")
         guardar_csv(publicaciones,  f"{USUARIO}_publicaciones.csv")
