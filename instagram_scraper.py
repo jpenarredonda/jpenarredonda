@@ -63,7 +63,7 @@ def obtener_perfil(usuario: str) -> dict:
     # Hacemos la petición imitando Chrome (imprescindible para no ser bloqueados)
     respuesta = cf_requests.get(url, headers=HEADERS, impersonate="chrome110")
 
-    if respuesta.status_code != 200:
+    if not (200 <= respuesta.status_code < 300):
         print(f"[✗] Error {respuesta.status_code}: no se pudo obtener el perfil.")
         return {}
 
@@ -113,7 +113,7 @@ def obtener_publicaciones(usuario: str) -> list:
 
     respuesta = cf_requests.get(url, headers=HEADERS, impersonate="chrome110")
 
-    if respuesta.status_code != 200:
+    if not (200 <= respuesta.status_code < 300):
         print(f"[✗] Error {respuesta.status_code}: no se pudieron obtener las publicaciones.")
         return []
 
