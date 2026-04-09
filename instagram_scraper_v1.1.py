@@ -347,12 +347,13 @@ if __name__ == "__main__":
     print("=" * 55)
 
     # --- Pedir session id ---
-    print("\nPara evitar bloqueos, el script necesita tu cookie de sesión.")
-    print("Cómo obtenerla:")
+    print("\nNecesitas dos valores de Instagram. Cómo obtenerlos:")
     print("  1. Abre Instagram en Chrome y logéate")
     print("  2. Presiona F12 → Application → Cookies → instagram.com")
-    print("  3. Copia el valor de 'sessionid'\n")
-    session_id = input("Pega tu sessionid aquí: ").strip()
+    print("  3. Copia los valores de 'sessionid' y 'csrftoken'\n")
+
+    session_id = input("Pega tu sessionid aquí:  ").strip()
+    csrftoken  = input("Pega tu csrftoken aquí:  ").strip()
 
     if not session_id:
         print("[!] No ingresaste sessionid. Se intentará sin sesión (puede fallar).")
@@ -360,12 +361,13 @@ if __name__ == "__main__":
         COOKIES["sessionid"] = session_id
         print("[✓] Sesión configurada.")
 
-    # Obtener csrftoken (necesario para peticiones POST)
-    print("[→] Obteniendo token de seguridad...")
-    csrftoken = _get_csrftoken()
+    if not csrftoken:
+        print("[!] No ingresaste csrftoken. Intentando obtenerlo automáticamente...")
+        csrftoken = _get_csrftoken()
+
     if csrftoken:
         COOKIES["csrftoken"] = csrftoken
-        print("[✓] Token obtenido.")
+        print("[✓] Token de seguridad configurado.")
     else:
         print("[!] No se pudo obtener el csrftoken. La paginación puede fallar.")
 
